@@ -44,6 +44,7 @@
 use std::sync::Arc;
 
 mod connection;
+mod driver;
 mod endpoint;
 mod incoming;
 mod mutex;
@@ -78,6 +79,7 @@ pub use crate::connection::{
     AcceptBi, AcceptUni, Connecting, Connection, OpenBi, OpenUni, ReadDatagram, ReadDatagrams,
     SendDatagram, SendDatagramError, ZeroRttAccepted,
 };
+pub use crate::driver::{DriverLifecycle, DriverOutcome};
 pub use crate::endpoint::{Accept, Endpoint, EndpointStats};
 pub use crate::incoming::{Incoming, IncomingFuture, RetryError};
 pub use crate::recv_stream::{ReadError, ReadExactError, ReadToEndError, RecvStream, ResetError};

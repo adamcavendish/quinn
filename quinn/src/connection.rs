@@ -20,7 +20,7 @@ use tokio::sync::{Notify, futures::Notified, mpsc, oneshot};
 use tracing::{Instrument, Span, debug_span};
 
 use crate::{
-    ConnectionEvent, Duration, Instant, VarInt,
+    ConnectionEvent, DriverLifecycle, DriverOutcome, Duration, Instant, VarInt,
     mutex::Mutex,
     recv_stream::RecvStream,
     runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPoller},
@@ -36,6 +36,7 @@ use proto::{
 #[derive(Debug)]
 pub struct Connecting {
     conn: Option<ConnectionRef>,
+    driver_lifecycle: DriverLifecycle,
     connected: oneshot::Receiver<bool>,
     handshake_data_ready: Option<oneshot::Receiver<()>>,
 }
@@ -48,6 +49,7 @@ impl Connecting {
         conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
         socket: Arc<dyn AsyncUdpSocket>,
         runtime: Arc<dyn Runtime>,
+        endpoint_driver: DriverLifecycle,
     ) -> Self {
         let (on_handshake_data_send, on_handshake_data_recv) = oneshot::channel();
         let (on_connected_send, on_connected_recv) = oneshot::channel();
@@ -60,23 +62,29 @@ impl Connecting {
             on_connected_send,
             socket,
             runtime.clone(),
+            endpoint_driver,
         );
 
+        let driver_lifecycle = conn.shared.driver_lifecycle.clone();
         let driver = ConnectionDriver::new(conn.clone());
         runtime.spawn(Box::pin(
-            async {
-                if let Err(e) = driver.await {
-                    tracing::error!("I/O error: {e}");
-                }
-            }
-            .instrument(Span::current()),
+            driver_lifecycle.track(driver).instrument(Span::current()),
         ));
 
         Self {
             conn: Some(conn),
+            driver_lifecycle,
             connected: on_connected_recv,
             handshake_data_ready: Some(on_handshake_data_recv),
         }
+    }
+
+    /// Observe this attempt's driver, including failure before handshake completion.
+    ///
+    /// The result persists even if the runtime stopped the driver before
+    /// `connect` returned. The receipt does not keep transport objects alive.
+    pub fn driver_lifecycle(&self) -> DriverLifecycle {
+        self.driver_lifecycle.clone()
     }
 
     /// Convert into a 0-RTT or 0.5-RTT connection at the cost of weakened security
@@ -234,8 +242,7 @@ impl Future for ZeroRttAccepted {
 /// `Connection` API object to the `Endpoint` task and the related stream-related interfaces.
 /// It also keeps track of outstanding timeouts for the `Connection`.
 ///
-/// If the connection encounters an error condition, this future will yield an error. It will
-/// terminate (yielding `Ok(())`) if the connection was closed without error. Unlike other
+/// The final outcome distinguishes drained completion, I/O failure and endpoint loss. Unlike other
 /// connection-related futures, this waits for the draining period to complete to ensure that
 /// packets still in flight from the peer are handled gracefully.
 #[must_use = "connection drivers must be spawned for their connections to function"]
@@ -257,22 +264,39 @@ impl ConnectionDriver {
 }
 
 impl Future for ConnectionDriver {
-    type Output = Result<(), io::Error>;
+    type Output = DriverOutcome;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let conn = &mut *self.conn.state.lock("poll");
         let _guard = self.span.enter();
 
         if let Err(e) = conn.process_conn_events(&self.conn.shared, cx) {
+            let outcome = DriverOutcome::EndpointLost(
+                self.conn
+                    .shared
+                    .endpoint_driver
+                    .outcome()
+                    .unwrap_or_else(|| Arc::new(DriverOutcome::Stopped)),
+            );
+            // Ordinary close waiters can run before the outer task publishes.
+            // Make the endpoint's original cause visible before waking them.
+            self.conn.shared.driver_lifecycle.record(outcome.clone());
             conn.terminate(e, &self.conn.shared);
-            return Poll::Ready(Ok(()));
+            return Poll::Ready(outcome);
         }
-        let mut keep_going = conn.drive_transmit(cx).inspect_err(|_| {
-            // Transmit failed, so close the connection and clean state before returning the error.
-            if !conn.inner.is_closed() {
-                conn.implicit_close(&self.conn.shared);
+        let mut keep_going = match conn.drive_transmit(cx) {
+            Ok(keep_going) => keep_going,
+            Err(error) => {
+                // Preserve the original I/O error separately from the local
+                // close used to notify ordinary connection/stream operations.
+                let outcome = DriverOutcome::Io(Arc::new(error));
+                self.conn.shared.driver_lifecycle.record(outcome.clone());
+                if !conn.inner.is_closed() {
+                    conn.implicit_close(&self.conn.shared);
+                }
+                return Poll::Ready(outcome);
             }
-        })?;
+        };
 
         // If a timer expires, there might be more to transmit. When we transmit something, we
         // might need to reset a timer. Hence, we must loop until neither happens.
@@ -292,7 +316,7 @@ impl Future for ConnectionDriver {
         if conn.error.is_none() {
             unreachable!("drained connections always have an error");
         }
-        Poll::Ready(Ok(()))
+        Poll::Ready(DriverOutcome::Drained(conn.error.clone()))
     }
 }
 
@@ -315,6 +339,14 @@ impl Future for ConnectionDriver {
 pub struct Connection(ConnectionRef);
 
 impl Connection {
+    /// Observe the outcome and destruction of this connection's driver.
+    ///
+    /// This receipt does not keep the connection alive and does not certify
+    /// destruction of its protocol core, streams, routes or socket references.
+    pub fn driver_lifecycle(&self) -> DriverLifecycle {
+        self.0.shared.driver_lifecycle.clone()
+    }
+
     /// Initiate a new outgoing unidirectional stream.
     ///
     /// Streams are cheap and instantaneous to open unless blocked by flow control. As a
@@ -980,6 +1012,7 @@ impl ConnectionRef {
         on_connected: oneshot::Sender<bool>,
         socket: Arc<dyn AsyncUdpSocket>,
         runtime: Arc<dyn Runtime>,
+        endpoint_driver: DriverLifecycle,
     ) -> Self {
         Self(Arc::new(ConnectionInner {
             state: Mutex::new(State {
@@ -1003,7 +1036,16 @@ impl ConnectionRef {
                 send_buffer: Vec::new(),
                 buffered_transmit: None,
             }),
-            shared: Shared::default(),
+            shared: Shared {
+                stream_budget_available: Default::default(),
+                stream_incoming: Default::default(),
+                datagram_received: Notify::new(),
+                datagrams_unblocked: Notify::new(),
+                closed: Notify::new(),
+                ref_count: AtomicUsize::new(0),
+                driver_lifecycle: DriverLifecycle::new(),
+                endpoint_driver,
+            },
         }))
     }
 
@@ -1050,8 +1092,10 @@ pub(crate) struct ConnectionInner {
     pub(crate) shared: Shared,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Shared {
+    driver_lifecycle: DriverLifecycle,
+    endpoint_driver: DriverLifecycle,
     /// Notified when new streams may be locally initiated due to an increase in stream ID flow
     /// control budget
     stream_budget_available: [Notify; 2],

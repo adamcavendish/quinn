@@ -18,7 +18,7 @@ use std::{
 #[cfg(all(not(wasm_browser), any(feature = "aws-lc-rs", feature = "ring")))]
 use crate::runtime::default_runtime;
 use crate::{
-    Instant,
+    DriverLifecycle, DriverOutcome, Instant,
     runtime::{AsyncUdpSocket, Runtime},
     udp_transmit,
 };
@@ -151,18 +151,25 @@ impl Endpoint {
         );
         let driver = EndpointDriver(rc.clone());
         runtime.spawn(Box::pin(
-            async {
-                if let Err(e) = driver.await {
-                    tracing::error!("I/O error: {}", e);
-                }
-            }
-            .instrument(Span::current()),
+            rc.shared
+                .driver_lifecycle
+                .track(driver)
+                .instrument(Span::current()),
         ));
         Ok(Self {
             inner: rc,
             default_client_config: None,
             runtime,
         })
+    }
+
+    /// Observe this endpoint driver's outcome and future destruction.
+    ///
+    /// An I/O cause is published before connection channels are torn down.
+    /// The receipt retains no endpoint or socket ownership. It does not certify
+    /// destruction of routes, connections or shared UDP socket references.
+    pub fn driver_lifecycle(&self) -> DriverLifecycle {
+        self.inner.shared.driver_lifecycle.clone()
     }
 
     /// Get the next incoming connection attempt from a client
@@ -364,7 +371,7 @@ pub struct EndpointStats {
 pub(crate) struct EndpointDriver(pub(crate) EndpointRef);
 
 impl Future for EndpointDriver {
-    type Output = Result<(), io::Error>;
+    type Output = DriverOutcome;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let mut endpoint = self.0.state.lock().unwrap();
@@ -374,7 +381,10 @@ impl Future for EndpointDriver {
 
         let now = endpoint.runtime.now();
         let mut keep_going = false;
-        keep_going |= endpoint.drive_recv(cx, now)?;
+        keep_going |= match endpoint.drive_recv(cx, now) {
+            Ok(keep_going) => keep_going,
+            Err(error) => return Poll::Ready(DriverOutcome::Io(Arc::new(error))),
+        };
         keep_going |= endpoint.handle_events(cx, &self.0.shared);
 
         if !endpoint.recv_state.incoming.is_empty() {
@@ -382,7 +392,7 @@ impl Future for EndpointDriver {
         }
 
         if self.0.shared.ref_count.load(Ordering::Relaxed) == 0 && endpoint.is_idle() {
-            Poll::Ready(Ok(()))
+            Poll::Ready(DriverOutcome::Drained(None))
         } else {
             drop(endpoint);
             // If there is more work to do schedule the endpoint task again.
@@ -522,6 +532,7 @@ pub(crate) struct State {
 
 #[derive(Debug)]
 pub(crate) struct Shared {
+    driver_lifecycle: DriverLifecycle,
     incoming: Notify,
     idle: Notify,
     /// Number of live handles that can be used to initiate or handle I/O; excludes the driver
@@ -634,6 +645,7 @@ fn proto_ecn(ecn: udp::EcnCodepoint) -> proto::EcnCodepoint {
 
 #[derive(Debug)]
 struct ConnectionSet {
+    endpoint_driver: DriverLifecycle,
     /// Senders for communicating with the endpoint's connections
     senders: FxHashMap<ConnectionHandle, mpsc::UnboundedSender<ConnectionEvent>>,
     /// Stored to give out clones to new ConnectionInners
@@ -667,7 +679,15 @@ impl ConnectionSet {
                 self.senders.insert(handle, send);
             }
         }
-        Connecting::new(handle, conn, self.sender.clone(), recv, socket, runtime)
+        Connecting::new(
+            handle,
+            conn,
+            self.sender.clone(),
+            recv,
+            socket,
+            runtime,
+            self.endpoint_driver.clone(),
+        )
     }
 
     fn is_empty(&self) -> bool {
@@ -732,9 +752,16 @@ impl EndpointRef {
         runtime: Arc<dyn Runtime>,
     ) -> Self {
         let (sender, events) = mpsc::unbounded_channel();
-        let recv_state = RecvState::new(sender, socket.max_receive_segments(), &inner);
+        let driver_lifecycle = DriverLifecycle::new();
+        let recv_state = RecvState::new(
+            sender,
+            socket.max_receive_segments(),
+            &inner,
+            driver_lifecycle.clone(),
+        );
         Self(Arc::new(EndpointInner {
             shared: Shared {
+                driver_lifecycle,
                 incoming: Notify::new(),
                 idle: Notify::new(),
                 ref_count: AtomicUsize::new(0),
@@ -798,6 +825,7 @@ impl RecvState {
         sender: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
         max_receive_segments: usize,
         endpoint: &proto::Endpoint,
+        endpoint_driver: DriverLifecycle,
     ) -> Self {
         let recv_buf = vec![
             0;
@@ -807,6 +835,7 @@ impl RecvState {
         ];
         Self {
             connections: ConnectionSet {
+                endpoint_driver,
                 senders: FxHashMap::default(),
                 sender,
                 close: None,
@@ -940,7 +969,7 @@ mod tests {
         let mut endpoint =
             proto::Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut state = RecvState::new(tx, 1, &endpoint);
+        let mut state = RecvState::new(tx, 1, &endpoint, DriverLifecycle::new());
         let now = Instant::now();
 
         // Calibrate the next receive cycles to allow two work items each.
